@@ -1,14 +1,8 @@
 FROM balenalib/raspberrypi3-debian:stretch
-#FROM balenalib/armv7hf-alpine
-
 
 ENV DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket
 ENV UDEV=1
 
-#RUN  apt-get update
-
-#RUN apk --update --upgrade add \
-#RUN  apt-get install -y \
 RUN install_packages \
   alsa-utils \
   bluealsa \
@@ -18,7 +12,7 @@ RUN install_packages \
   python-gpiozero
 
 # Copy sounds
-COPY sounds /usr/src/sounds
+#COPY sounds /usr/src/sounds
 
 # Setup udev rules - this lets us play the connect/disconnect sound,
 # turn off discover/pairing when a client is connected
@@ -26,7 +20,7 @@ COPY sounds /usr/src/sounds
 COPY bluetooth-udev /usr/src/
 RUN chmod +x /usr/src/bluetooth-udev
 COPY udev-rules/ /etc/udev/rules.d/
-COPY bluetooth-scripts/ /usr/src/bluetooth-scripts/
+#COPY bluetooth-scripts/ /usr/src/bluetooth-scripts/
 
 # Bluetooth-agent handles the auth of devices
 COPY bluetooth-agent /usr/src/
