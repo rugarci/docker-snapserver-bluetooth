@@ -14,6 +14,8 @@ add)
     printf "discoverable off\npairable off\nexit\n" | bluetoothctl
     echo $NAME | tr -d '"' > /var/cache/bluetooth/reconnect_device  # Save the mac address of the last connected device (for reconnect after reboot)
 
+    echo "Connected" > /dev/stdout
+    
     amixer -M sset PCM,0 $CONNECTION_NOTIFY_VOLUME% > /dev/null &
     amixer -M sset Digital,0 $CONNECTION_NOTIFY_VOLUME% > /dev/null &
     
@@ -26,6 +28,7 @@ add)
     fi
     ;;
 remove)
+    echo "Disconnected" > /dev/stdout
     amixer -M sset PCM,0 $CONNECTION_NOTIFY_VOLUME% > /dev/null &
     amixer -M sset Digital,0 $CONNECTION_NOTIFY_VOLUME% > /dev/null &
 
