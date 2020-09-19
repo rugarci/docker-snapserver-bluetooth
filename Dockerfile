@@ -9,7 +9,9 @@ RUN install_packages \
   bluez \ 
   python-dbus \
   python-gobject \
-  python-gpiozero
+  python-gpiozero \
+  supervisor
+
 
 # Copy sounds
 #COPY sounds /usr/src/sounds
@@ -31,5 +33,7 @@ RUN chmod +x /usr/src/start.sh
 
 COPY .asoundrc /root/.asoundrc
 
-CMD [ "/bin/bash", "/usr/src/start.sh" ]
+COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+
+CMD ["/usr/bin/supervisord"]
 
