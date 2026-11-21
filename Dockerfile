@@ -1,39 +1,27 @@
-FROM balenalib/raspberrypi3-debian:stretch
+FROM debian:trixie-slim
 
-ENV DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket
-ENV UDEV=1
+# Bluetooth A2DP sink that writes the received audio into a Snapcast pipe.
+# Uses the host's bluetoothd and system D-Bus (mount /run/dbus).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      bluez \
+      bluez-alsa-utils \
+      netcat-openbsd \
+      python3-dbus \
+      python3-gi \
+      tini \
+ && rm -rf /var/lib/apt/lists/*
 
-RUN install_packages \
-  alsa-utils \
-  bluealsa \
-  bluez \ 
-  python-dbus \
-  python-gobject \
-  python-gpiozero \
-  supervisor
+ENV DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket \
+    PYTHONUNBUFFERED=1
 
+# ALSA default device: resample to 48 kHz/S16_LE and write to the Snapcast FIFO
+COPY asound.conf /etc/asound.conf
+COPY bluetooth-agent start.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/bluetooth-agent /usr/local/bin/start.sh
 
-# Copy sounds
-#COPY sounds /usr/src/sounds
+# Last connected device, used to reconnect after a restart
+VOLUME ["/var/cache/bluetooth"]
 
-# Setup udev rules - this lets us play the connect/disconnect sound,
-# turn off discover/pairing when a client is connected
-# and also run a python script
-COPY bluetooth-udev /usr/src/
-RUN chmod +x /usr/src/bluetooth-udev
-COPY udev-rules/ /etc/udev/rules.d/
-#COPY bluetooth-scripts/ /usr/src/bluetooth-scripts/
-
-# Bluetooth-agent handles the auth of devices
-COPY bluetooth-agent /usr/src/
-RUN chmod +x /usr/src/bluetooth-agent
-
-COPY start.sh /usr/src/
-RUN chmod +x /usr/src/start.sh
-
-COPY .asoundrc /root/.asoundrc
-
-COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
-
-CMD ["/usr/bin/supervisord"]
-
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["start.sh"]

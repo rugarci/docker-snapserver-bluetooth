@@ -1,110 +1,256 @@
-#!/usr/bin/python
-# Modified from https://github.com/nicokaiser/rpi-audio-receiver/blob/master/install-bluetooth.sh
-# Automatically authenticating bluez agent.
+#!/usr/bin/env python3
+"""BlueZ agent for a headless A2DP sink.
 
-from __future__ import absolute_import, print_function, unicode_literals
+- Accepts every pairing request (NoInputNoOutput, or a fixed PIN code).
+- Names the adapter and makes it discoverable and pairable while idle.
+- Hides the adapter while a device is connected and shows it again afterwards.
+- With BLUETOOTH_PAIRING_WINDOW, visible during that many seconds after start instead
+  (connected or not); then it stays hidden and rejects new pairings, while paired devices
+  can still connect.
+- Remembers the last connected device and reconnects to it on start.
 
-from gi.repository import GObject
+Based on https://github.com/nicokaiser/rpi-audio-receiver.
+"""
 
 import os
 import sys
-import dbus
-import dbus.service
-import dbus.mainloop.glib
 
-BUS_NAME = 'org.bluez'
-AGENT_INTERFACE = 'org.bluez.Agent1'
-AGENT_PATH = "/test/agent"
-LEGACY_MODE = os.getenv('BLUETOOTH_PIN_CODE', None)
-PIN_CODE = os.getenv('BLUETOOTH_PIN_CODE', "0000")
+import dbus
+import dbus.mainloop.glib
+import dbus.service
+from gi.repository import GLib
+
+BUS_NAME = "org.bluez"
+AGENT_INTERFACE = "org.bluez.Agent1"
+ADAPTER_INTERFACE = "org.bluez.Adapter1"
+DEVICE_INTERFACE = "org.bluez.Device1"
+PROPS_INTERFACE = "org.freedesktop.DBus.Properties"
+AGENT_PATH = "/snapserver/bluetooth/agent"
+A2DP_SOURCE_UUID = "0000110a-0000-1000-8000-00805f9b34fb"
+A2DP_SINK_UUID = "0000110b-0000-1000-8000-00805f9b34fb"
+
+HCI = os.getenv("BLUETOOTH_HCI", "hci0")
+ADAPTER_PATH = "/org/bluez/" + HCI
+DEVICE_NAME = os.getenv("DEVICE_NAME", "Snapcast")
+PIN_CODE = os.getenv("BLUETOOTH_PIN_CODE")
+RECONNECT_FILE = "/var/cache/bluetooth/reconnect_device"
+# Seconds after start during which new devices can find and pair with the adapter.
+# Empty: visible and pairable whenever no audio device is connected.
+PAIRING_WINDOW = os.getenv("BLUETOOTH_PAIRING_WINDOW", "").strip()
 
 bus = None
-device_obj = None
-dev_path = None
+mainloop = None
+window_open = True
+
+
+class Rejected(dbus.DBusException):
+    _dbus_error_name = "org.bluez.Error.Rejected"
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def props(path):
+    return dbus.Interface(bus.get_object(BUS_NAME, path), PROPS_INTERFACE)
 
 
 def set_trusted(path):
-    props = dbus.Interface(bus.get_object(
-        "org.bluez", path), "org.freedesktop.DBus.Properties")
-    props.Set("org.bluez.Device1", "Trusted", True)
+    props(path).Set(DEVICE_INTERFACE, "Trusted", True)
+
+
+def set_visible(visible):
+    # With a pairing window, visibility follows the window only (a paired device that
+    # reconnects on start must not block new pairings). Paired devices can always connect.
+    if PAIRING_WINDOW:
+        visible = window_open
+    adapter = props(ADAPTER_PATH)
+    adapter.Set(ADAPTER_INTERFACE, "Discoverable", dbus.Boolean(visible))
+    adapter.Set(ADAPTER_INTERFACE, "Pairable", dbus.Boolean(visible))
+
+
+def is_audio_source(dev):
+    # Only devices that stream audio to us count. BLE links (e.g. a BLE chat app on the
+    # same adapter) must not hide the speaker or replace the device to reconnect to.
+    return A2DP_SOURCE_UUID in [str(u).lower() for u in dev.get("UUIDs", [])]
+
+
+def connected_devices():
+    manager = dbus.Interface(bus.get_object(BUS_NAME, "/"), "org.freedesktop.DBus.ObjectManager")
+    for path, ifaces in manager.GetManagedObjects().items():
+        dev = ifaces.get(DEVICE_INTERFACE)
+        if dev and path.startswith(ADAPTER_PATH + "/") and dev.get("Connected") and is_audio_source(dev):
+            yield str(dev["Address"])
+
+
+def on_connection_changed(path, connected, audio=False):
+    if not path.startswith(ADAPTER_PATH + "/"):
+        return
+    if not audio and not is_audio_source(props(path).GetAll(DEVICE_INTERFACE)):
+        return
+    address = str(props(path).Get(DEVICE_INTERFACE, "Address"))
+    if connected:
+        log("Connected: %s" % address)
+        try:
+            with open(RECONNECT_FILE, "w") as f:
+                f.write(address + "\n")
+        except OSError as e:
+            log("Could not save %s: %s" % (RECONNECT_FILE, e))
+        set_visible(False)
+    elif not any(connected_devices()):
+        log("Disconnected: %s" % address)
+        set_visible(True)
+
+
+def on_properties_changed(interface, changed, invalidated, path=None):
+    if interface == DEVICE_INTERFACE and "Connected" in changed:
+        on_connection_changed(path, bool(changed["Connected"]))
+
+
+def on_interfaces_added(path, interfaces):
+    # A device that pairs for the first time appears already connected,
+    # so there is no PropertiesChanged signal for "Connected".
+    dev = interfaces.get(DEVICE_INTERFACE)
+    if dev and dev.get("Connected"):
+        on_connection_changed(path, True)
+
+
+def on_service_authorized(device, uuid):
+    # Fallback for the same case: the device is connected when it asks for a service.
+    # Its UUIDs may not be resolved yet, so trust the A2DP service it asks for.
+    if props(device).Get(DEVICE_INTERFACE, "Connected"):
+        audio = str(uuid).lower() in (A2DP_SOURCE_UUID, A2DP_SINK_UUID)
+        on_connection_changed(device, True, audio)
+
+
+def close_pairing_window():
+    global window_open
+    window_open = False
+    set_visible(False)
+    log("Pairing window closed: hidden and not pairable (paired devices can still connect)")
+    return False  # run once from GLib.timeout_add_seconds
+
+
+def check_pairing(device):
+    # Second line of defence: BlueZ refuses pairing anyway while the adapter is not pairable.
+    if not window_open:
+        log("Pairing rejected, the pairing window is closed (%s)" % device)
+        raise Rejected("Pairing window closed")
+
+
+def reconnect_last_device():
+    try:
+        with open(RECONNECT_FILE) as f:
+            address = f.read().strip()
+    except OSError:
+        return False
+    if not address:
+        return False
+    path = "%s/dev_%s" % (ADAPTER_PATH, address.replace(":", "_"))
+    log("Reconnecting to previous device %s" % address)
+    device = dbus.Interface(bus.get_object(BUS_NAME, path), DEVICE_INTERFACE)
+    device.Connect(
+        reply_handler=lambda: log("Reconnected to %s" % address),
+        error_handler=lambda e: log("Reconnect to %s failed: %s" % (address, e.get_dbus_name())),
+    )
+    return False  # run once from GLib.timeout_add_seconds
 
 
 class Agent(dbus.service.Object):
-    exit_on_release = True
-
-    def set_exit_on_release(self, exit_on_release):
-        self.exit_on_release = exit_on_release
-
     @dbus.service.method(AGENT_INTERFACE, in_signature="", out_signature="")
     def Release(self):
-        print("Release")
-        if self.exit_on_release:
-            mainloop.quit()
+        log("Agent released")
+        mainloop.quit()
 
     @dbus.service.method(AGENT_INTERFACE, in_signature="os", out_signature="")
     def AuthorizeService(self, device, uuid):
-        print("AuthorizeService (%s, %s)" % (device, uuid))
+        log("AuthorizeService (%s, %s)" % (device, uuid))
+        if not props(device).Get(DEVICE_INTERFACE, "Paired"):
+            check_pairing(device)
         set_trusted(device)
-        return
+        on_service_authorized(device, uuid)
 
     @dbus.service.method(AGENT_INTERFACE, in_signature="o", out_signature="s")
     def RequestPinCode(self, device):
-        print("RequestPinCode (%s)" % (device))
+        log("RequestPinCode (%s)" % device)
+        check_pairing(device)
         set_trusted(device)
-        return PIN_CODE
+        return PIN_CODE or "0000"
 
     @dbus.service.method(AGENT_INTERFACE, in_signature="o", out_signature="u")
     def RequestPasskey(self, device):
-        print("RequestPasskey (%s)" % (device))
+        log("RequestPasskey (%s)" % device)
+        check_pairing(device)
         set_trusted(device)
-        return dbus.UInt32(PIN_CODE)
+        return dbus.UInt32(int(PIN_CODE or "0"))
 
     @dbus.service.method(AGENT_INTERFACE, in_signature="ouq", out_signature="")
     def DisplayPasskey(self, device, passkey, entered):
-        print("DisplayPasskey (%s, %06u entered %u)" % (device, passkey, entered))
+        log("DisplayPasskey (%s, %06u entered %u)" % (device, passkey, entered))
 
     @dbus.service.method(AGENT_INTERFACE, in_signature="os", out_signature="")
     def DisplayPinCode(self, device, pincode):
-        print("DisplayPinCode (%s, %s)" % (device, pincode))
+        log("DisplayPinCode (%s, %s)" % (device, pincode))
 
     @dbus.service.method(AGENT_INTERFACE, in_signature="ou", out_signature="")
     def RequestConfirmation(self, device, passkey):
-        print("RequestConfirmation (%s, %06d)" % (device, passkey))
+        log("RequestConfirmation (%s, %06d)" % (device, passkey))
+        check_pairing(device)
         set_trusted(device)
-        return
 
     @dbus.service.method(AGENT_INTERFACE, in_signature="o", out_signature="")
     def RequestAuthorization(self, device):
-        print("RequestAuthorization (%s)" % (device))
+        log("RequestAuthorization (%s)" % device)
+        check_pairing(device)
         set_trusted(device)
-        return
 
     @dbus.service.method(AGENT_INTERFACE, in_signature="", out_signature="")
     def Cancel(self):
-        print("Cancel")
+        log("Cancel")
 
 
-if __name__ == '__main__':
+def main():
+    global bus, mainloop
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
-
     bus = dbus.SystemBus()
+    mainloop = GLib.MainLoop()
 
-    if LEGACY_MODE is None:
-        capability = "NoInputNoOutput"
+    adapter = props(ADAPTER_PATH)
+    adapter.Set(ADAPTER_INTERFACE, "Powered", dbus.Boolean(True))
+    adapter.Set(ADAPTER_INTERFACE, "Alias", DEVICE_NAME)
+    adapter.Set(ADAPTER_INTERFACE, "DiscoverableTimeout", dbus.UInt32(0))
+    adapter.Set(ADAPTER_INTERFACE, "PairableTimeout", dbus.UInt32(0))
+    set_visible(not any(connected_devices()))
+
+    Agent(bus, AGENT_PATH)
+    capability = "KeyboardDisplay" if PIN_CODE else "NoInputNoOutput"
+    manager = dbus.Interface(bus.get_object(BUS_NAME, "/org/bluez"), "org.bluez.AgentManager1")
+    manager.RegisterAgent(AGENT_PATH, capability)
+    manager.RequestDefaultAgent(AGENT_PATH)
+    log("Bluetooth agent registered (%s)" % capability)
+
+    bus.add_signal_receiver(
+        on_properties_changed,
+        signal_name="PropertiesChanged",
+        dbus_interface=PROPS_INTERFACE,
+        bus_name=BUS_NAME,
+        path_keyword="path",
+    )
+    bus.add_signal_receiver(
+        on_interfaces_added,
+        signal_name="InterfacesAdded",
+        dbus_interface="org.freedesktop.DBus.ObjectManager",
+        bus_name=BUS_NAME,
+    )
+
+    GLib.timeout_add_seconds(2, reconnect_last_device)
+    if PAIRING_WINDOW:
+        GLib.timeout_add_seconds(int(PAIRING_WINDOW), close_pairing_window)
+        log('Device is discoverable as "%s" for %s s' % (DEVICE_NAME, PAIRING_WINDOW))
     else:
-        capability = "KeyboardDisplay"
-
-    path = "/test/agent"
-    agent = Agent(bus, path)
-
-    mainloop = GObject.MainLoop()
-
-    obj = bus.get_object(BUS_NAME, "/org/bluez")
-    manager = dbus.Interface(obj, "org.bluez.AgentManager1")
-    manager.RegisterAgent(path, capability)
-
-    print("Bluetooth agent registered")
-
-    manager.RequestDefaultAgent(path)
-
+        log('Device is discoverable as "%s" while no audio device is connected' % DEVICE_NAME)
     mainloop.run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,64 +1,84 @@
 #!/usr/bin/env bash
+# Start the BlueALSA A2DP sink, the pairing agent and the player that feeds Snapcast.
+# If any of them exits, the container exits and Docker restarts it.
+set -euo pipefail
 
+HCI="${BLUETOOTH_HCI:-hci0}"
+export BLUETOOTH_HCI="$HCI"
+export DEVICE_NAME="${DEVICE_NAME:-${BLUETOOTH_DEVICE_NAME:-BT-$(hostname | cut -c -4)}}"
 
-if [[ -z "$DEVICE_NAME" ]]; then
-   if [[ "$BLUETOOTH_DEVICE_NAME" ]]; then
-     DEVICE_NAME="$BLUETOOTH_DEVICE_NAME"
-   else
-     DEVICE_NAME=$(printf "BT-%s" $(hostname | cut -c -4))
-   fi
-fi
+# Wait for the host's bluetoothd to expose the adapter
+for _ in $(seq 30); do
+  if dbus-send --system --print-reply --dest=org.bluez "/org/bluez/$HCI" \
+       org.freedesktop.DBus.Properties.Get string:org.bluez.Adapter1 string:Address >/dev/null 2>&1; then
+    break
+  fi
+  echo "Waiting for bluetoothd and $HCI..."
+  sleep 2
+done
 
-# Set the system volume here
-SYSTEM_OUTPUT_VOLUME="${SYSTEM_OUTPUT_VOLUME:-75}"
-echo $SYSTEM_OUTPUT_VOLUME > /usr/src/system_output_volume
-printf "Setting output volume to %s%%\n" "$SYSTEM_OUTPUT_VOLUME"
-amixer -M sset PCM,0 $SYSTEM_OUTPUT_VOLUME% > /dev/null &
-amixer -M sset Digital,0 $SYSTEM_OUTPUT_VOLUME% > /dev/null &
+# Run a btmgmt command. Without a TTY, btmgmt quits as soon as stdin hits EOF, often
+# before the command is sent, and otherwise never exits: keep stdin open and bound it.
+btmgmt_cmd() {
+  sleep 3 | timeout 5 btmgmt --index "${HCI#hci}" "$@" >/dev/null 2>&1
+  local rc=$?
+  (( rc == 0 || rc == 124 ))
+}
 
-# Set the volume of the connection notification sounds here
-CONNECTION_NOTIFY_VOLUME="${CONNECTION_NOTIFY_VOLUME:-75}"
-echo $CONNECTION_NOTIFY_VOLUME > /usr/src/connection_notify_volume
-printf "Connection notify volume is %s%%\n" "$CONNECTION_NOTIFY_VOLUME"
-
-# Set the discoverable timeout here
-dbus-send --system --dest=org.bluez --print-reply /org/bluez/hci0 org.freedesktop.DBus.Properties.Set string:'org.bluez.Adapter1' string:'DiscoverableTimeout' variant:uint32:0 > /dev/null
-
-printf "Restarting bluetooth service\n"
-service bluetooth restart > /dev/null
-sleep 2
-
-# Redirect stdout to null, because it prints the old BT device name, which
-# can be confusing and it also hides those commands from the logs as well.
-printf "discoverable on\npairable on\nexit\n" | bluetoothctl > /dev/null
-
-# Start bluetooth and audio agent
-/usr/src/bluetooth-agent &
-
-rm -rf /var/run/bluealsa/
-/usr/bin/bluealsa -i hci0 -p a2dp-sink &
-
-hciconfig hci1 down > /dev/null 2>&1 # Disable onboard bluetooth if using a bluetooth dongle (onboard interface gets remapped to hci1) 
-hciconfig hci0 up
-hciconfig hci0 name "$DEVICE_NAME"
-
-if ! [ -z "$BLUETOOTH_PIN_CODE" ] && [[ $BLUETOOTH_PIN_CODE -gt 1 ]] && [[ $BLUETOOTH_PIN_CODE -lt 1000000 ]]; then
-  hciconfig hci0 sspmode 0  # Legacy pairing (PIN CODE)
-  printf "Starting bluetooth agent in Legacy Pairing Mode - PIN CODE is \"%s\"\n" "$BLUETOOTH_PIN_CODE"
+# Legacy PIN pairing needs Secure Simple Pairing disabled on the controller
+# (requires network_mode: host and NET_ADMIN for the management socket).
+pin="${BLUETOOTH_PIN_CODE:-}"
+if [[ "$pin" =~ ^[0-9]{1,6}$ ]]; then
+  echo "Legacy pairing mode, PIN code is \"$pin\""
+  btmgmt_cmd ssp off || echo "WARNING: could not disable SSP" >&2
 else
-  hciconfig hci0 sspmode 1  # Secure Simple Pairing
-  printf "Starting bluetooth agent in Secure Simple Pairing Mode (SSPM) - No PIN code provided or invalid\n"
+  # SSP is the controller default; nothing to change
+  echo "Secure Simple Pairing mode (no PIN code)"
 fi
 
-# Reconnect if there is a known device
-sleep 2
-if [ -f "/var/cache/bluetooth/reconnect_device" ]; then
-  TRUSTED_MAC_ADDRESS=$(cat /var/cache/bluetooth/reconnect_device)
-  printf "Attempting to reconnect to previous bluetooth device: %s\n" "$TRUSTED_MAC_ADDRESS"
-  printf "connect %s\nexit\n" "$TRUSTED_MAC_ADDRESS" | bluetoothctl > /dev/null
+mkdir -p /var/cache/bluetooth /var/cache/snapcast
+
+# Optional: send the audio to a remote Snapcast TCP source (host:port) instead of the FIFO.
+# The ALSA file plugin pipes into the command when the name starts with '|'.
+if [[ -n "${SNAPCAST_TCP:-}" ]]; then
+  echo "Sending audio to Snapcast TCP source $SNAPCAST_TCP"
+  sed -i "s#^\(\s*file \).*#\1\"|exec nc -N ${SNAPCAST_TCP%:*} ${SNAPCAST_TCP##*:}\"#" /etc/asound.conf
+else
+  echo "Writing audio to /var/cache/snapcast/snapfifo"
 fi
 
+bluealsa -i "$HCI" -p a2dp-sink &
+sleep 1
+bluetooth-agent &
+bluealsa-aplay --pcm-buffer-time=1000000 00:00:00:00:00:00 &
 sleep 2
-printf "Device is discoverable as \"%s\"\n" "$DEVICE_NAME"
-exec /usr/bin/bluealsa-aplay --pcm-buffer-time=1000000 00:00:00:00:00:00
 
+# Amazon Echo devices only list speakers that look like a classic one: BR/EDR only
+# (no LE) and the class of a loudspeaker with the Audio service bit. BlueZ cannot set
+# service bits, so write the class to the controller after the UUIDs are registered.
+# Both need network_mode: host and NET_ADMIN. LE is turned back on when the container stops.
+le_off=0
+if [[ "${BLUETOOTH_CLASSIC_ONLY:-1}" == 1 ]]; then
+  btmgmt_cmd le off || true
+  le_off=1
+  echo "Bluetooth LE disabled on $HCI (BR/EDR only)"
+fi
+if [[ -n "${BLUETOOTH_CLASS:-0x240414}" ]]; then
+  hciconfig "$HCI" class "${BLUETOOTH_CLASS:-0x240414}" \
+    && echo "Class of device set to ${BLUETOOTH_CLASS:-0x240414}" \
+    || echo "WARNING: could not set the class of device" >&2
+fi
+
+cleanup() {
+  kill $(jobs -p) 2>/dev/null || true
+  wait 2>/dev/null || true
+  if (( le_off )); then
+    btmgmt_cmd le on || true
+    echo "Bluetooth LE enabled again on $HCI"
+  fi
+}
+trap 'cleanup; exit 0' TERM INT
+wait -n
+echo "A child process exited, stopping" >&2
+cleanup
+exit 1
